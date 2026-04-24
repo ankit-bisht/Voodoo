@@ -368,14 +368,51 @@ def _sanitise_json_control_chars(s: str) -> str:
     return ''.join(out)
 
 
-def collect_context_files() -> list[dict]:
-    """Read .py files from CODE_CONTEXT_DIRS; return [{path, content}]."""
+def extract_concerned_folder(description: str) -> str | None:
+    """
+    Parse the ticket description for a line like:
+        Concerned Folder - s3toescontentupdate
+        Concerned Folder: s3toescontentupdate
+    Returns the folder name (stripped, first non-whitespace token only), or None if not found.
+    """
+    if not description:
+        return None
+    # Use \S+ to capture only the folder name token, ignoring any trailing text on the same line
+    m = re.search(r"Concerned\s+Folder\s*[-:–—]\s*(\S+)", description, re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    return None
+
+
+def _find_dir_in_repo(folder_name: str) -> str | None:
+    """
+    Search LOCAL_REPO recursively for a directory whose name matches folder_name.
+    Returns the repo-relative path string, or None if not found.
+    Skips hidden directories and __pycache__.
+    """
+    repo = Path(LOCAL_REPO)
+    for candidate in repo.rglob(folder_name):
+        if candidate.is_dir() and "__pycache__" not in candidate.parts:
+            return str(candidate.relative_to(repo))
+    return None
+
+
+def collect_context_files(dirs: list[str] | None = None) -> list[dict]:
+    """Read .py files from the given dirs (or CODE_CONTEXT_DIRS as fallback); return [{path, content}]."""
+    effective_dirs = dirs if dirs is not None else CODE_CONTEXT_DIRS
     files = []
     repo = Path(LOCAL_REPO)
-    for dir_rel in CODE_CONTEXT_DIRS:
+    for dir_rel in effective_dirs:
         dir_path = repo / dir_rel
         if not dir_path.exists():
-            continue
+            # Try to find the folder anywhere in the repo tree
+            found_rel = _find_dir_in_repo(dir_rel)
+            if found_rel:
+                log.info("Context directory '%s' not at root — found at: %s", dir_rel, found_rel)
+                dir_path = repo / found_rel
+            else:
+                log.warning("Context directory not found anywhere in repo: %s", dir_rel)
+                continue
         for py_file in sorted(dir_path.rglob("*.py")):
             if "__pycache__" in py_file.parts:
                 continue
@@ -404,7 +441,15 @@ def generate_code_changes_ai(issue: dict) -> list[dict]:
             "OpenAI-Intent": "conversation-panel",
         },
     )
-    context_files = collect_context_files()
+    concerned_folder = extract_concerned_folder(issue.get("description", ""))
+    if concerned_folder:
+        log.info("[%s] Concerned folder from ticket: '%s'", issue["key"], concerned_folder)
+        context_dirs = [concerned_folder]
+    else:
+        log.info("[%s] No 'Concerned Folder' in description — falling back to CODE_CONTEXT_DIRS", issue["key"])
+        context_dirs = None
+
+    context_files = collect_context_files(context_dirs)
     log.info("[%s] Sending %d file(s) to GitHub Copilot (%s) for code generation", issue["key"], len(context_files), COPILOT_MODEL)
 
     files_block = "\n\n".join(
